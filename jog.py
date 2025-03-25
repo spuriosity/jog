@@ -164,7 +164,6 @@ def flatten_visible(nodes, filter_set=None):
         result.append(node)
         if node.children:
             if filter_set is not None:
-                # Force-expand containers that are in the filter set
                 has_filtered_children = any(
                     id(c) in filter_set for c in node.children
                 )
@@ -175,6 +174,62 @@ def flatten_visible(nodes, filter_set=None):
     return result
 
 
+def sibling_jump(visible, cursor, direction, root_nodes, filter_set=None):
+    """Jump to the next/prev parent sibling, landing on the matching key if possible."""
+    node = visible[cursor]
+    parent = node.parent
+
+    if parent is None:
+        siblings = root_nodes
+        my_pos = next((i for i, s in enumerate(siblings) if s is node), None)
+        if my_pos is None:
+            return None
+        target_pos = my_pos + direction
+        if target_pos < 0 or target_pos >= len(siblings):
+            return None
+        target = siblings[target_pos]
+        for i, v in enumerate(visible):
+            if v is target:
+                return i
+        return None
+
+    grandparent = parent.parent
+    parent_siblings = root_nodes if grandparent is None else grandparent.children
+
+    parent_pos = next((i for i, s in enumerate(parent_siblings) if s is parent), None)
+    if parent_pos is None:
+        return None
+
+    target_pos = parent_pos + direction
+    if target_pos < 0 or target_pos >= len(parent_siblings):
+        return None
+
+    target_parent = parent_siblings[target_pos]
+
+    if target_parent.kind != "scalar" and not target_parent.expanded:
+        target_parent.expanded = True
+
+    if target_parent.expanded and target_parent.children:
+        for child in target_parent.children:
+            if child.key == node.key:
+                new_visible = flatten_visible(root_nodes, filter_set)
+                for i, v in enumerate(new_visible):
+                    if v is child:
+                        return i
+                break
+        new_visible = flatten_visible(root_nodes)
+        first = target_parent.children[0]
+        for i, v in enumerate(new_visible):
+            if v is first:
+                return i
+
+    new_visible = flatten_visible(root_nodes)
+    for i, v in enumerate(new_visible):
+        if v is target_parent:
+            return i
+    return None
+
+
 def find_parent_index(visible, node):
     """Find the index of a node's parent in the visible list."""
     if node.parent is None:
@@ -183,6 +238,45 @@ def find_parent_index(visible, node):
         if n is node.parent:
             return i
     return None
+
+
+def draw_help(stdscr, height, width):
+    """Draw the help panel."""
+    lines = [
+        "╭─── Shortcuts ───────────────────╮",
+        "│                                  │",
+        "│  ↑ / k      Move up              │",
+        "│  ↓ / j      Move down            │",
+        "│  J          Next sibling          │",
+        "│  K          Previous sibling      │",
+        "│  → / l      Expand node          │",
+        "│  ← / h      Collapse / go parent │",
+        "│  Enter      Toggle expand         │",
+        "│  e          Expand all            │",
+        "│  x          Collapse all          │",
+        "│  s          Sort object keys a-z  │",
+        "│  g          Go to top             │",
+        "│  G          Go to bottom          │",
+        "│  /          Filter by key (fuzzy) │",
+        "│  f          Filter by value       │",
+        "│  n          Next match            │",
+        "│  N          Previous match        │",
+        "│  Esc        Clear filter          │",
+        "│  c          Copy value to clipbrd │",
+        "│  C          Copy key to clipboard  │",
+        "│  ?          Toggle this help      │",
+        "│  q          Quit                  │",
+        "│                                  │",
+        "╰──────────────────────────────────╯",
+    ]
+    start_y = max(0, (height - len(lines)) // 2)
+    start_x = max(0, (width - len(lines[0])) // 2)
+    for i, line in enumerate(lines):
+        if start_y + i < height:
+            try:
+                stdscr.addstr(start_y + i, start_x, line, curses.color_pair(4))
+            except curses.error:
+                pass
 
 
 def draw_filter_bar(stdscr, height, width, query, mode):
@@ -208,30 +302,126 @@ def collapse_all(nodes):
         collapse_all(node.children)
 
 
+def copy_to_clipboard(text):
+    """Copy text to macOS clipboard via pbcopy."""
+    import subprocess
+    try:
+        proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+        proc.communicate(text.encode("utf-8"))
+    except FileNotFoundError:
+        pass
+
+
 def scalar_color_pair(node):
     """Return the color pair number for a scalar node based on its Python type."""
     v = node.value
     if v is None:
-        return 10  # null/None — muted red
+        return 10
     elif isinstance(v, bool):
-        return 11  # bool — orange/yellow
+        return 11
     elif isinstance(v, (int, float)):
-        return 12  # number — cyan
+        return 12
     else:
-        return 2   # string — green
+        return 2
+
+
+def draw_tree_rows(win, nodes, cursor, scroll_offset, view_height, width,
+                   y_offset=0, x_offset=0, filter_query="", filter_mode="key",
+                   highlight_set=None):
+    """Render tree rows into a curses window. Shared by main view and popup."""
+    if highlight_set is None:
+        highlight_set = set()
+    visible = nodes
+    for row_idx in range(view_height):
+        node_idx = scroll_offset + row_idx
+        if node_idx >= len(visible):
+            break
+        node = visible[node_idx]
+        indent = "  " * node.depth
+        is_selected = node_idx == cursor
+        is_match = node_idx in highlight_set
+
+        if node.kind in ("object", "list"):
+            icon = "▼ " if node.expanded else "▶ "
+        else:
+            icon = "  "
+
+        key_str = node.display_key()
+        val_str = node.display_value()
+
+        x = x_offset
+        row_y = y_offset + row_idx
+        attr_base = curses.color_pair(6) | curses.A_BOLD if is_selected else 0
+
+        try:
+            win.addstr(row_y, x, indent, attr_base)
+            x += len(indent)
+
+            icon_attr = attr_base | (curses.color_pair(9) if not is_selected else 0)
+            win.addstr(row_y, x, icon, icon_attr)
+            x += len(icon)
+
+            key_match_idx = set()
+            val_match_idx = set()
+            if is_match and not is_selected and filter_query:
+                if filter_mode == "key":
+                    key_match_idx = fuzzy_match_indices(filter_query, str(key_str)) or set()
+                elif filter_mode == "value" and node.kind == "scalar":
+                    val_match_idx = fuzzy_match_indices(filter_query, val_str) or set()
+
+            if isinstance(node.key, int):
+                key_base = curses.color_pair(7) if not is_selected else curses.color_pair(6) | curses.A_BOLD
+            else:
+                key_base = curses.color_pair(1) if not is_selected else curses.color_pair(6) | curses.A_BOLD
+            key_hi = curses.color_pair(8) | curses.A_BOLD
+            key_text = str(key_str)
+            for ci, ch in enumerate(key_text):
+                if x >= x_offset + width - 1:
+                    break
+                attr = key_hi if ci in key_match_idx else key_base
+                win.addstr(row_y, x, ch, attr)
+                x += 1
+
+            if val_str:
+                sep = ": "
+                win.addstr(row_y, x, sep, attr_base)
+                x += len(sep)
+
+                if node.kind == "scalar":
+                    val_base = curses.color_pair(scalar_color_pair(node)) if not is_selected else curses.color_pair(6) | curses.A_BOLD
+                else:
+                    val_base = curses.color_pair(3) if not is_selected else curses.color_pair(6) | curses.A_BOLD
+                val_hi = curses.color_pair(8) | curses.A_BOLD
+
+                max_val_len = (x_offset + width) - x - 1
+                display_val = val_str[:max_val_len] if len(val_str) > max_val_len else val_str
+                for ci, ch in enumerate(display_val):
+                    if x >= x_offset + width - 1:
+                        break
+                    attr = val_hi if ci in val_match_idx else val_base
+                    win.addstr(row_y, x, ch, attr)
+                    x += 1
+
+            if is_selected:
+                remaining = (x_offset + width) - x - 1
+                if remaining > 0:
+                    win.addstr(row_y, x, " " * remaining, curses.color_pair(6))
+        except curses.error:
+            pass
 
 
 def main(stdscr, data):
     curses.curs_set(0)
     curses.use_default_colors()
 
-    # Attempt 256-color definitions; fall back to basic 8 if unsupported
     use_256 = curses.COLORS >= 256
 
     if use_256:
         C_KEY = 110
         C_STRING = 120
         C_CONTAINER = 179
+        C_HELP_FG = 255
+        C_HELP_BG = 236
         C_SEARCH_FG = 255
         C_SEARCH_BG = 238
         C_SEL_FG = 235
@@ -247,6 +437,7 @@ def main(stdscr, data):
         curses.init_pair(1, C_KEY, -1)
         curses.init_pair(2, C_STRING, -1)
         curses.init_pair(3, C_CONTAINER, -1)
+        curses.init_pair(4, C_HELP_FG, C_HELP_BG)
         curses.init_pair(5, C_SEARCH_FG, C_SEARCH_BG)
         curses.init_pair(6, C_SEL_FG, C_SEL_BG)
         curses.init_pair(7, C_INDEX, -1)
@@ -259,6 +450,7 @@ def main(stdscr, data):
         curses.init_pair(1, curses.COLOR_BLUE, -1)
         curses.init_pair(2, curses.COLOR_GREEN, -1)
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLACK)
         curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLACK)
         curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_BLUE)
         curses.init_pair(7, curses.COLOR_MAGENTA, -1)
@@ -268,7 +460,6 @@ def main(stdscr, data):
         curses.init_pair(11, curses.COLOR_YELLOW, -1)
         curses.init_pair(12, curses.COLOR_CYAN, -1)
 
-    # Build the root nodes
     if isinstance(data, dict):
         root_nodes = [JsonNode(k, v, depth=0) for k, v in data.items()]
     elif isinstance(data, list):
@@ -278,6 +469,7 @@ def main(stdscr, data):
 
     cursor = 0
     scroll_offset = 0
+    show_help = False
     filter_input_active = False
     filter_mode = "key"
     filter_query = ""
@@ -289,7 +481,6 @@ def main(stdscr, data):
         stdscr.erase()
         height, width = stdscr.getmaxyx()
 
-        # Recompute filter set from query (live as you type)
         if filter_query:
             filter_set = compute_filter_set(root_nodes, filter_query, filter_mode)
         elif not filter_input_active:
@@ -328,7 +519,6 @@ def main(stdscr, data):
             scroll_offset = cursor - view_height + 1
         scroll_offset = max(0, scroll_offset)
 
-        # Determine which visible nodes are direct fuzzy matches (for highlighting)
         highlight_set = set()
         if filter_query:
             for i, node in enumerate(visible):
@@ -337,84 +527,10 @@ def main(stdscr, data):
                 elif filter_mode == "value" and node.kind == "scalar" and fuzzy_match(filter_query, repr(node.value)):
                     highlight_set.add(i)
 
-        # Draw rows
-        for row_idx in range(view_height):
-            node_idx = scroll_offset + row_idx
-            if node_idx >= len(visible):
-                break
-            node = visible[node_idx]
-            indent = "  " * node.depth
-            is_selected = node_idx == cursor
-            is_match = node_idx in highlight_set
+        draw_tree_rows(stdscr, visible, cursor, scroll_offset, view_height,
+                       width, filter_query=filter_query, filter_mode=filter_mode,
+                       highlight_set=highlight_set)
 
-            if node.kind in ("object", "list"):
-                icon = "▼ " if node.expanded else "▶ "
-            else:
-                icon = "  "
-
-            key_str = node.display_key()
-            val_str = node.display_value()
-
-            x = 0
-            attr_base = curses.color_pair(6) | curses.A_BOLD if is_selected else 0
-
-            try:
-                stdscr.addstr(row_idx, x, indent, attr_base)
-                x += len(indent)
-
-                icon_attr = attr_base | (curses.color_pair(9) if not is_selected else 0)
-                stdscr.addstr(row_idx, x, icon, icon_attr)
-                x += len(icon)
-
-                # Per-character highlight indices
-                key_match_idx = set()
-                val_match_idx = set()
-                if is_match and not is_selected and filter_query:
-                    if filter_mode == "key":
-                        key_match_idx = fuzzy_match_indices(filter_query, str(key_str)) or set()
-                    elif filter_mode == "value" and node.kind == "scalar":
-                        val_match_idx = fuzzy_match_indices(filter_query, val_str) or set()
-
-                if isinstance(node.key, int):
-                    key_base = curses.color_pair(7) if not is_selected else curses.color_pair(6) | curses.A_BOLD
-                else:
-                    key_base = curses.color_pair(1) if not is_selected else curses.color_pair(6) | curses.A_BOLD
-                key_hi = curses.color_pair(8) | curses.A_BOLD
-                key_text = str(key_str)
-                for ci, ch in enumerate(key_text):
-                    if x >= width - 1:
-                        break
-                    attr = key_hi if ci in key_match_idx else key_base
-                    stdscr.addstr(row_idx, x, ch, attr)
-                    x += 1
-
-                if val_str:
-                    stdscr.addstr(row_idx, x, ": ", attr_base)
-                    x += 2
-
-                    if node.kind == "scalar":
-                        val_base = curses.color_pair(scalar_color_pair(node)) if not is_selected else curses.color_pair(6) | curses.A_BOLD
-                    else:
-                        val_base = curses.color_pair(3) if not is_selected else curses.color_pair(6) | curses.A_BOLD
-                    val_hi = curses.color_pair(8) | curses.A_BOLD
-
-                    max_val_len = width - x - 1
-                    display_val = val_str[:max_val_len] if len(val_str) > max_val_len else val_str
-                    for ci, ch in enumerate(display_val):
-                        if x >= width - 1:
-                            break
-                        attr = val_hi if ci in val_match_idx else val_base
-                        stdscr.addstr(row_idx, x, ch, attr)
-                        x += 1
-
-                if is_selected:
-                    remaining = width - x - 1
-                    if remaining > 0:
-                        stdscr.addstr(row_idx, x, " " * remaining, curses.color_pair(6))
-            except curses.error:
-                pass
-
-        # Status bar
         status_y = height - 2
         try:
             bar = f" {cursor + 1}/{len(visible)}  depth:{visible[cursor].depth}"
@@ -429,10 +545,13 @@ def main(stdscr, data):
             pass
 
         try:
-            hint = " q quit  / filter keys  f filter values  n/N next/prev match  Esc clear"
+            hint = " ? help  q quit  / filter keys  f filter values  Esc clear"
             stdscr.addstr(height - 1, 0, hint[:width - 1], curses.A_DIM)
         except curses.error:
             pass
+
+        if show_help:
+            draw_help(stdscr, height, width)
 
         if filter_input_active:
             draw_filter_bar(stdscr, height, width, filter_query, filter_mode)
@@ -465,6 +584,11 @@ def main(stdscr, data):
                 cursor = min(len(visible) - 1, cursor + 1)
             elif 32 <= key <= 126:
                 filter_query += chr(key)
+            continue
+
+        if show_help:
+            if key in (ord("?"), 27, ord("q")):
+                show_help = False
             continue
 
         node = visible[cursor]
@@ -501,6 +625,8 @@ def main(stdscr, data):
         elif key in (curses.KEY_ENTER, 10, 13):
             if node.kind != "scalar":
                 node.expanded = not node.expanded
+        elif key == ord("?"):
+            show_help = True
         elif key == ord("e"):
             expand_all(root_nodes)
         elif key == ord("x"):
@@ -530,6 +656,14 @@ def main(stdscr, data):
             if highlight_set:
                 earlier = sorted((i for i in highlight_set if i < cursor), reverse=True)
                 cursor = earlier[0] if earlier else max(highlight_set)
+        elif key == ord("J"):
+            idx = sibling_jump(visible, cursor, 1, root_nodes, filter_set)
+            if idx is not None:
+                cursor = idx
+        elif key == ord("K"):
+            idx = sibling_jump(visible, cursor, -1, root_nodes, filter_set)
+            if idx is not None:
+                cursor = idx
         elif key == ord("s"):
             cur_key = visible[cursor].key
             cur_parent = visible[cursor].parent
@@ -540,6 +674,22 @@ def main(stdscr, data):
                     cursor = i
                     break
             status_msg = "sorted objects alphabetically"
+        elif key == ord("c"):
+            if node.kind == "scalar":
+                if isinstance(node.value, str):
+                    copy_to_clipboard(node.value)
+                    status_msg = f"copied: {node.value}"
+                else:
+                    copy_to_clipboard(json.dumps(node.value))
+                    status_msg = f"copied: {json.dumps(node.value)}"
+            else:
+                text = json.dumps(node.value, indent=2)
+                copy_to_clipboard(text)
+                lines = text.count("\n") + 1
+                status_msg = f"copied subtree ({lines} lines)"
+        elif key == ord("C"):
+            copy_to_clipboard(str(node.display_key()))
+            status_msg = f"copied key: {node.display_key()}"
 
 
 def run():
