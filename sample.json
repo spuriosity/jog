@@ -1,0 +1,26 @@
+{
+  "name": "cargo.one",
+  "version": "2.5.0",
+  "active": true,
+  "employees": 150,
+  "headquarters": null,
+  "config": {
+    "database": {
+      "host": "localhost",
+      "port": 5444,
+      "password": "secret",
+      "replicas": ["db-1", "db-2", "db-3"]
+    },
+    "features": {
+      "dark_mode": true,
+      "beta_access": false,
+      "max_retries": 3
+    }
+  },
+  "services": [
+    {"name": "rate-service", "port": 8001, "healthy": true},
+    {"name": "booking-service", "port": 8002, "healthy": true},
+    {"name": "auth-service", "port": 8003, "healthy": false}
+  ],
+  "tags": ["freight", "logistics", "air-cargo", "saas"]
+}
