@@ -164,6 +164,7 @@ def flatten_visible(nodes, filter_set=None):
         result.append(node)
         if node.children:
             if filter_set is not None:
+                # Force-expand containers that are in the filter set
                 has_filtered_children = any(
                     id(c) in filter_set for c in node.children
                 )
@@ -175,11 +176,21 @@ def flatten_visible(nodes, filter_set=None):
 
 
 def sibling_jump(visible, cursor, direction, root_nodes, filter_set=None):
-    """Jump to the next/prev parent sibling, landing on the matching key if possible."""
+    """Jump to the next/prev parent sibling, landing on the matching key if possible.
+
+    When the cursor is on a child key inside a container (e.g. 'port' inside
+    services[0]), this jumps to the parent's next/prev sibling (services[1])
+    and tries to land on the child with the same key ('port'). Falls back to
+    the first child, or the sibling node itself if it isn't expanded.
+
+    When the cursor is already on a top-level or root-level entry, it simply
+    jumps to the next/prev entry at the same level.
+    """
     node = visible[cursor]
     parent = node.parent
 
     if parent is None:
+        # Top-level node: jump between root nodes
         siblings = root_nodes
         my_pos = next((i for i, s in enumerate(siblings) if s is node), None)
         if my_pos is None:
@@ -193,6 +204,7 @@ def sibling_jump(visible, cursor, direction, root_nodes, filter_set=None):
                 return i
         return None
 
+    # Node has a parent — jump to matching key in parent's next sibling.
     grandparent = parent.parent
     parent_siblings = root_nodes if grandparent is None else grandparent.children
 
@@ -206,23 +218,28 @@ def sibling_jump(visible, cursor, direction, root_nodes, filter_set=None):
 
     target_parent = parent_siblings[target_pos]
 
+    # Auto-expand so the matching child is visible
     if target_parent.kind != "scalar" and not target_parent.expanded:
         target_parent.expanded = True
 
     if target_parent.expanded and target_parent.children:
+        # Try to find a child with the same key
         for child in target_parent.children:
             if child.key == node.key:
+                # Re-flatten since we may have expanded
                 new_visible = flatten_visible(root_nodes, filter_set)
                 for i, v in enumerate(new_visible):
                     if v is child:
                         return i
                 break
+        # Fallback: first child
         new_visible = flatten_visible(root_nodes)
         first = target_parent.children[0]
         for i, v in enumerate(new_visible):
             if v is first:
                 return i
 
+    # Not expandable: jump to the sibling itself
     new_visible = flatten_visible(root_nodes)
     for i, v in enumerate(new_visible):
         if v is target_parent:
@@ -251,6 +268,7 @@ def draw_help(stdscr, height, width):
         "│  K          Previous sibling      │",
         "│  → / l      Expand node          │",
         "│  ← / h      Collapse / go parent │",
+        "│  Space      Peek value (popup)    │",
         "│  Enter      Toggle expand         │",
         "│  e          Expand all            │",
         "│  x          Collapse all          │",
@@ -316,13 +334,13 @@ def scalar_color_pair(node):
     """Return the color pair number for a scalar node based on its Python type."""
     v = node.value
     if v is None:
-        return 10
+        return 10  # null/None — muted red
     elif isinstance(v, bool):
-        return 11
+        return 11  # bool — orange/yellow
     elif isinstance(v, (int, float)):
-        return 12
+        return 12  # number — cyan
     else:
-        return 2
+        return 2   # string — green
 
 
 def draw_tree_rows(win, nodes, cursor, scroll_offset, view_height, width,
@@ -331,7 +349,7 @@ def draw_tree_rows(win, nodes, cursor, scroll_offset, view_height, width,
     """Render tree rows into a curses window. Shared by main view and popup."""
     if highlight_set is None:
         highlight_set = set()
-    visible = nodes
+    visible = nodes  # already flattened
     for row_idx in range(view_height):
         node_idx = scroll_offset + row_idx
         if node_idx >= len(visible):
@@ -361,6 +379,7 @@ def draw_tree_rows(win, nodes, cursor, scroll_offset, view_height, width,
             win.addstr(row_y, x, icon, icon_attr)
             x += len(icon)
 
+            # Per-character highlight indices
             key_match_idx = set()
             val_match_idx = set()
             if is_match and not is_selected and filter_query:
@@ -410,29 +429,191 @@ def draw_tree_rows(win, nodes, cursor, scroll_offset, view_height, width,
             pass
 
 
+def show_value_popup(stdscr, source_node):
+    """Show a navigable popup of the node's full value tree.
+
+    Supports all navigation keys and recursive space for sub-popups.
+    """
+    screen_h, screen_w = stdscr.getmaxyx()
+    p_h = max(7, screen_h * 4 // 5)
+    p_w = max(30, screen_w * 4 // 5)
+    p_y = (screen_h - p_h) // 2
+    p_x = (screen_w - p_w) // 2
+
+    win = curses.newwin(p_h, p_w, p_y, p_x)
+    win.keypad(True)
+
+    # Build fresh unfiltered tree from the node's raw value
+    if source_node.kind == "scalar":
+        # Simple scalar popup — just display the value
+        while True:
+            win.erase()
+            win.border()
+            title = f" {source_node.display_key()} "
+            try:
+                win.addstr(0, 2, title, curses.A_BOLD | curses.color_pair(1))
+            except curses.error:
+                pass
+            val_text = repr(source_node.value)
+            # Word-wrap long scalars
+            inner_w = p_w - 4
+            lines = [val_text[i:i + inner_w] for i in range(0, len(val_text), inner_w)]
+            for i, line in enumerate(lines):
+                if 2 + i >= p_h - 1:
+                    break
+                try:
+                    win.addstr(2 + i, 2, line, curses.color_pair(scalar_color_pair(source_node)))
+                except curses.error:
+                    pass
+            try:
+                win.addstr(p_h - 1, 2, " Esc close  c copy ", curses.A_DIM)
+            except curses.error:
+                pass
+            win.refresh()
+            key = win.getch()
+            if key == 27 or key == ord("q"):
+                break
+            elif key == ord("c"):
+                if isinstance(source_node.value, str):
+                    copy_to_clipboard(source_node.value)
+                else:
+                    copy_to_clipboard(json.dumps(source_node.value))
+        del win
+        stdscr.touchwin()
+        stdscr.refresh()
+        return
+
+    # Complex value — build navigable tree
+    if isinstance(source_node.value, dict):
+        popup_roots = [JsonNode(k, v, depth=0) for k, v in source_node.value.items()]
+    elif isinstance(source_node.value, list):
+        popup_roots = [JsonNode(i, v, depth=0) for i, v in enumerate(source_node.value)]
+    else:
+        popup_roots = []
+
+    cursor = 0
+    scroll = 0
+    content_h = p_h - 3  # border top + title line + border bottom
+
+    while True:
+        win.erase()
+        win.border()
+
+        title = f" {source_node.display_key()} "
+        try:
+            win.addstr(0, 2, title, curses.A_BOLD | curses.color_pair(1))
+        except curses.error:
+            pass
+
+        visible = flatten_visible(popup_roots)
+        if not visible:
+            try:
+                win.addstr(2, 2, "(empty)")
+            except curses.error:
+                pass
+        else:
+            cursor = max(0, min(cursor, len(visible) - 1))
+            if cursor < scroll:
+                scroll = cursor
+            if cursor >= scroll + content_h:
+                scroll = cursor - content_h + 1
+            scroll = max(0, scroll)
+
+            draw_tree_rows(win, visible, cursor, scroll, content_h,
+                           p_w - 2, y_offset=1, x_offset=1)
+
+        # Bottom hint
+        try:
+            hint = " Esc close  Space peek  c copy  ↑↓jk nav  ←h/→l fold "
+            win.addstr(p_h - 1, 2, hint[:p_w - 4], curses.A_DIM)
+        except curses.error:
+            pass
+
+        win.refresh()
+        key = win.getch()
+
+        if not visible:
+            if key == 27 or key == ord("q"):
+                break
+            continue
+
+        node = visible[cursor]
+
+        if key == 27 or key == ord("q"):
+            break
+        elif key in (curses.KEY_UP, ord("k")):
+            cursor = max(0, cursor - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            cursor = min(len(visible) - 1, cursor + 1)
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            if node.kind != "scalar" and not node.expanded:
+                node.expanded = True
+        elif key in (curses.KEY_LEFT, ord("h")):
+            if node.expanded and node.kind != "scalar":
+                node.expanded = False
+            elif node.parent is not None:
+                pidx = find_parent_index(visible, node)
+                if pidx is not None:
+                    visible[pidx].expanded = False
+                    cursor = pidx
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if node.kind != "scalar":
+                node.expanded = not node.expanded
+        elif key == ord("e"):
+            expand_all(popup_roots)
+        elif key == ord("x"):
+            collapse_all(popup_roots)
+            cursor = 0
+            scroll = 0
+        elif key == ord("g"):
+            cursor = 0
+            scroll = 0
+        elif key == ord("G"):
+            cursor = len(visible) - 1
+        elif key == ord(" "):
+            show_value_popup(stdscr, node)
+            win.touchwin()
+        elif key == ord("c"):
+            if node.kind == "scalar":
+                if isinstance(node.value, str):
+                    copy_to_clipboard(node.value)
+                else:
+                    copy_to_clipboard(json.dumps(node.value))
+            else:
+                copy_to_clipboard(json.dumps(node.value, indent=2))
+        elif key == ord("C"):
+            copy_to_clipboard(str(node.display_key()))
+
+    del win
+    stdscr.touchwin()
+    stdscr.refresh()
+
+
 def main(stdscr, data):
     curses.curs_set(0)
     curses.use_default_colors()
 
+    # Attempt 256-color definitions; fall back to basic 8 if unsupported
     use_256 = curses.COLORS >= 256
 
     if use_256:
-        C_KEY = 110
-        C_STRING = 120
-        C_CONTAINER = 179
-        C_HELP_FG = 255
-        C_HELP_BG = 236
+        # Catppuccin Mocha-inspired palette (on default terminal bg)
+        C_KEY = 110       # soft blue — object keys
+        C_STRING = 120    # muted green — strings
+        C_CONTAINER = 179 # warm gold — collapsed {…}/[…]
+        C_HELP_FG = 255   # white
+        C_HELP_BG = 236   # dark grey
         C_SEARCH_FG = 255
         C_SEARCH_BG = 238
-        C_SEL_FG = 235
-        C_SEL_BG = 110
-        C_INDEX = 183
+        C_SEL_FG = 235    # near-black text
+        C_SEL_BG = 110    # soft blue highlight
+        C_INDEX = 183     # lavender — list indices
         C_MATCH_FG = 235
-        C_MATCH_BG = 179
-        C_ICON = 245
-        C_NULL = 167
-        C_BOOL = 215
-        C_NUMBER = 80
+        C_MATCH_BG = 179  # gold highlight
+        C_ICON = 245      # grey — expand/collapse arrows
+        C_NULL = 167      # muted red — None
+        C_BOOL = 215      # orange — booleans
+        C_NUMBER = 80     # teal/cyan — numbers
 
         curses.init_pair(1, C_KEY, -1)
         curses.init_pair(2, C_STRING, -1)
@@ -460,6 +641,7 @@ def main(stdscr, data):
         curses.init_pair(11, curses.COLOR_YELLOW, -1)
         curses.init_pair(12, curses.COLOR_CYAN, -1)
 
+    # Build the root nodes
     if isinstance(data, dict):
         root_nodes = [JsonNode(k, v, depth=0) for k, v in data.items()]
     elif isinstance(data, list):
@@ -470,17 +652,18 @@ def main(stdscr, data):
     cursor = 0
     scroll_offset = 0
     show_help = False
-    filter_input_active = False
-    filter_mode = "key"
-    filter_query = ""
-    filter_set = None
-    saved_expand = None
+    filter_input_active = False   # True while typing in the filter bar
+    filter_mode = "key"           # "key" or "value"
+    filter_query = ""             # current filter text
+    filter_set = None             # set of node ids to show (None = no filter)
+    saved_expand = None           # expand state saved before filter
     status_msg = ""
 
     while True:
         stdscr.erase()
         height, width = stdscr.getmaxyx()
 
+        # Recompute filter set from query (live as you type)
         if filter_query:
             filter_set = compute_filter_set(root_nodes, filter_query, filter_mode)
         elif not filter_input_active:
@@ -504,6 +687,8 @@ def main(stdscr, data):
                             saved_expand = None
                 elif key in (curses.KEY_BACKSPACE, 127, 8):
                     filter_query = filter_query[:-1]
+                elif key == ord(" "):
+                    pass  # no nodes to peek at
                 elif 32 <= key <= 126:
                     filter_query += chr(key)
             elif key == ord("q"):
@@ -512,13 +697,15 @@ def main(stdscr, data):
 
         cursor = max(0, min(cursor, len(visible) - 1))
 
-        view_height = height - 2
+        # Scroll so cursor is visible
+        view_height = height - 2  # reserve bottom 2 lines for status
         if cursor < scroll_offset:
             scroll_offset = cursor
         if cursor >= scroll_offset + view_height:
             scroll_offset = cursor - view_height + 1
         scroll_offset = max(0, scroll_offset)
 
+        # Determine which visible nodes are direct fuzzy matches (for highlighting)
         highlight_set = set()
         if filter_query:
             for i, node in enumerate(visible):
@@ -527,10 +714,12 @@ def main(stdscr, data):
                 elif filter_mode == "value" and node.kind == "scalar" and fuzzy_match(filter_query, repr(node.value)):
                     highlight_set.add(i)
 
+        # Draw rows using shared renderer
         draw_tree_rows(stdscr, visible, cursor, scroll_offset, view_height,
                        width, filter_query=filter_query, filter_mode=filter_mode,
                        highlight_set=highlight_set)
 
+        # Status bar
         status_y = height - 2
         try:
             bar = f" {cursor + 1}/{len(visible)}  depth:{visible[cursor].depth}"
@@ -544,6 +733,7 @@ def main(stdscr, data):
         except curses.error:
             pass
 
+        # Bottom hint line
         try:
             hint = " ? help  q quit  / filter keys  f filter values  Esc clear"
             stdscr.addstr(height - 1, 0, hint[:width - 1], curses.A_DIM)
@@ -558,11 +748,12 @@ def main(stdscr, data):
 
         stdscr.refresh()
 
+        # Input
         key = stdscr.getch()
         status_msg = ""
 
         if filter_input_active:
-            if key == 27:
+            if key == 27:  # Escape — close input bar, keep filter active
                 filter_input_active = False
                 if not filter_query:
                     filter_set = None
@@ -570,6 +761,7 @@ def main(stdscr, data):
                         restore_expand_state(root_nodes, saved_expand)
                         saved_expand = None
             elif key in (curses.KEY_ENTER, 10, 13):
+                # Confirm filter — stop typing but keep the filter active
                 filter_input_active = False
                 if not filter_query:
                     filter_set = None
@@ -582,6 +774,10 @@ def main(stdscr, data):
                 cursor = max(0, cursor - 1)
             elif key in (curses.KEY_DOWN,):
                 cursor = min(len(visible) - 1, cursor + 1)
+            elif key == ord(" "):
+                # Space opens value popup even during filter input
+                if visible:
+                    show_value_popup(stdscr, visible[cursor])
             elif 32 <= key <= 126:
                 filter_query += chr(key)
             continue
@@ -589,11 +785,13 @@ def main(stdscr, data):
         if show_help:
             if key in (ord("?"), 27, ord("q")):
                 show_help = False
+            elif key == ord(" ") and visible:
+                show_value_popup(stdscr, visible[cursor])
             continue
 
         node = visible[cursor]
 
-        if key == 27:
+        if key == 27:  # Escape — clear active filter
             if filter_query:
                 filter_query = ""
                 filter_set = None
@@ -616,8 +814,10 @@ def main(stdscr, data):
                 node.expanded = True
         elif key in (curses.KEY_LEFT, ord("h")):
             if node.expanded and node.kind != "scalar":
+                # Collapse this node
                 node.expanded = False
             elif node.parent is not None:
+                # Navigate to parent
                 parent_idx = find_parent_index(visible, node)
                 if parent_idx is not None:
                     visible[parent_idx].expanded = False
@@ -649,6 +849,7 @@ def main(stdscr, data):
             filter_query = ""
             saved_expand = save_expand_state(root_nodes)
         elif key == ord("n"):
+            # Jump to next direct match in filtered view
             if highlight_set:
                 later = sorted(i for i in highlight_set if i > cursor)
                 cursor = later[0] if later else min(highlight_set)
@@ -665,10 +866,12 @@ def main(stdscr, data):
             if idx is not None:
                 cursor = idx
         elif key == ord("s"):
+            # Remember current node's key to re-find after sort
             cur_key = visible[cursor].key
             cur_parent = visible[cursor].parent
             sort_objects_recursive(root_nodes)
             visible = flatten_visible(root_nodes)
+            # Try to land back on the same node
             for i, v in enumerate(visible):
                 if v.key == cur_key and v.parent is cur_parent:
                     cursor = i
@@ -690,10 +893,13 @@ def main(stdscr, data):
         elif key == ord("C"):
             copy_to_clipboard(str(node.display_key()))
             status_msg = f"copied key: {node.display_key()}"
+        elif key == ord(" "):
+            show_value_popup(stdscr, node)
 
 
 def run():
     if len(sys.argv) < 2:
+        # Try reading from stdin
         if not sys.stdin.isatty():
             raw = sys.stdin.read()
         else:
